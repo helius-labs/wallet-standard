@@ -18,6 +18,7 @@ export type SolanaFeatures =
 /** TODO: docs */
 export type WalletWithSolanaFeatures = WalletWithFeatures<SolanaFeatures>;
 
+export * from './deriveSeed.js';
 export * from './signAndSendTransaction.js';
 export * from './signIn.js';
 export * from './signMessage.js';
