@@ -1,5 +1,4 @@
 import type { WalletWithFeatures } from '@wallet-standard/base';
-import type { TSPPDeriveSeedFeature } from './deriveSeed.js';
 import type { SolanaSignAndSendTransactionFeature } from './signAndSendTransaction.js';
 import type { SolanaSignInFeature } from './signIn.js';
 import type { SolanaSignMessageFeature } from './signMessage.js';
@@ -9,7 +8,6 @@ import type { SolanaSignOffchainMessageFeature } from './signOffchainMessage.js'
 
 /** TODO: docs */
 export type SolanaFeatures =
-    | TSPPDeriveSeedFeature
     | SolanaSignAndSendTransactionFeature
     | SolanaSignInFeature
     | SolanaSignMessageFeature
@@ -20,8 +18,8 @@ export type SolanaFeatures =
 /** TODO: docs */
 export type WalletWithSolanaFeatures = WalletWithFeatures<SolanaFeatures>;
 
-export * from './signAndSendTransaction.js';
 export * from './deriveSeed.js';
+export * from './signAndSendTransaction.js';
 export * from './signIn.js';
 export * from './signMessage.js';
 export * from './signTransaction.js';

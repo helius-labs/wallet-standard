@@ -10,7 +10,6 @@ import {
     WalletConnectionError,
     WalletDisconnectedError,
     WalletDisconnectionError,
-    WalletDerivePrivacySeedError,
     WalletError,
     type WalletName,
     WalletNotConnectedError,
@@ -23,10 +22,8 @@ import {
     WalletSignTransactionError,
 } from '@solana/wallet-adapter-base';
 import {
-    type DerivePrivacySeedInput,
-    type DerivePrivacySeedOutput,
     TSPPDeriveSeed,
-    type TSPPDeriveSeedFeature,
+    type TSPPDeriveSeedOutput,
     SolanaSignAndSendTransaction,
     type SolanaSignAndSendTransactionFeature,
     SolanaSignIn,
@@ -47,6 +44,14 @@ import {
     StandardEvents,
     type StandardEventsListeners,
 } from '@wallet-standard/features';
+import {
+    type DerivePrivacySeedInput,
+    type DerivePrivacySeedMethod,
+    type DerivePrivacySeedOutput,
+    getDeriveSeedFeature,
+    isUint8Array,
+    WalletDerivePrivacySeedError,
+} from './privacy.js';
 import { arraysEqual } from '@wallet-standard/wallet';
 import bs58 from 'bs58';
 
@@ -226,14 +231,7 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
             delete this.signMessage;
         }
 
-        const deriveSeedFeature = (this.#wallet.features as Partial<TSPPDeriveSeedFeature>)[TSPPDeriveSeed];
-        if (
-            deriveSeedFeature &&
-            typeof deriveSeedFeature === 'object' &&
-            deriveSeedFeature.version === '1.0.0' &&
-            typeof deriveSeedFeature.deriveSeed === 'function' &&
-            this.#account?.features.includes(TSPPDeriveSeed)
-        ) {
+        if (getDeriveSeedFeature(this.#wallet.features) && this.#account?.features.includes(TSPPDeriveSeed)) {
             this.derivePrivacySeed = this.#derivePrivacySeed;
         } else {
             delete this.derivePrivacySeed;
@@ -474,42 +472,38 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
         }
     }
 
-    derivePrivacySeed: ((input: DerivePrivacySeedInput) => Promise<DerivePrivacySeedOutput>) | undefined;
+    derivePrivacySeed: DerivePrivacySeedMethod | undefined;
     async #derivePrivacySeed(input: DerivePrivacySeedInput): Promise<DerivePrivacySeedOutput> {
         try {
             const account = this.#account;
             if (!account) throw new WalletNotConnectedError();
             if (input?.protocol !== 'tspp-v1') throw new WalletConfigError('Unsupported privacy derivation protocol');
 
-            const feature = (this.#wallet.features as Partial<TSPPDeriveSeedFeature>)[TSPPDeriveSeed];
-            if (
-                !feature ||
-                typeof feature !== 'object' ||
-                feature.version !== '1.0.0' ||
-                typeof feature.deriveSeed !== 'function'
-            ) {
-                throw new WalletConfigError('Wallet does not support tspp:deriveSeed version 1.0.0');
-            }
+            const feature = getDeriveSeedFeature(this.#wallet.features);
+            if (!feature) throw new WalletConfigError('Wallet does not support tspp:deriveSeed version 1.0.0');
             if (!account.features.includes(TSPPDeriveSeed)) {
                 throw new WalletAccountError('Account does not support privacy seed derivation');
             }
 
-            let output: DerivePrivacySeedOutput;
+            let output: TSPPDeriveSeedOutput;
             try {
                 output = await feature.deriveSeed({ account, protocol: input.protocol });
             } catch {
                 throw new WalletDerivePrivacySeedError('Wallet denied or failed privacy seed derivation');
             }
             if (!this.#account) throw new WalletNotConnectedError();
-            if (this.#account !== account) {
+            // Wallets may replace account objects on any change, so compare addresses.
+            if (this.#account.address !== account.address) {
                 throw new WalletAccountError('Wallet account changed during privacy seed derivation');
             }
             const seed = output?.derivationSeed;
-            if (!(seed instanceof Uint8Array) || seed.length !== 64) {
+            if (!isUint8Array(seed) || seed.length !== 64) {
                 throw new WalletDerivePrivacySeedError('Wallet returned an invalid privacy derivation seed');
             }
+            // `slice()` on a `Buffer` shares memory, so construct a new array.
             return { derivationSeed: new Uint8Array(seed) };
         } catch (cause) {
+            // Wallet errors can contain the seed, so their message and cause are dropped.
             const error =
                 cause instanceof WalletError
                     ? cause

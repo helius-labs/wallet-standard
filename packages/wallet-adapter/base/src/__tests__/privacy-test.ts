@@ -1,29 +1,25 @@
-/**
- * @jest-environment jsdom
- */
-
 import {
     BaseWalletAdapter,
     type WalletAdapterCompatibleStandardWallet,
     WalletAccountError,
     WalletConfigError,
-    WalletDerivePrivacySeedError,
     WalletError,
     type WalletName,
     WalletNotConnectedError,
     WalletReadyState,
 } from '@solana/wallet-adapter-base';
 import {
-    type DerivePrivacySeedInput,
     SolanaSignMessage,
     SolanaSignTransaction,
     TSPPDeriveSeed,
     type TSPPDeriveSeedFeature,
 } from '@solana/wallet-standard-features';
 import { PublicKey } from '@solana/web3.js';
+import { runInNewContext } from 'node:vm';
 import type { WalletAccount } from '@wallet-standard/base';
 import { StandardConnect, StandardEvents, type StandardEventsListeners } from '@wallet-standard/features';
 import { StandardWalletAdapter } from '../adapter.js';
+import { type DerivePrivacySeedInput, WalletDerivePrivacySeedError } from '../privacy.js';
 import { SolanaWalletAdapterWallet } from '../wallet.js';
 
 const publicKey = new PublicKey('Foo11111111111111111111111111111111111111111');
@@ -187,20 +183,36 @@ describe('StandardWalletAdapter.derivePrivacySeed', () => {
         }
     );
 
-    it.each([false, true])(
-        'discards results if the account changes during approval (same address: %s)',
-        async (sameAddress) => {
-            deriveSeed.mockImplementation(async () => {
-                Object.assign(wallet, {
-                    accounts: [{ ...account, address: sameAddress ? account.address : PublicKey.default.toBase58() }],
-                });
-                change({ accounts: wallet.accounts });
-                return { derivationSeed: new Uint8Array(64) };
-            });
-            await expect(adapter.derivePrivacySeed?.({ protocol: 'tspp-v1' })).rejects.toThrow(WalletAccountError);
-            expect(onError).toHaveBeenCalledTimes(1);
-        }
-    );
+    it('discards the result if the account changes during approval', async () => {
+        deriveSeed.mockImplementation(async () => {
+            Object.assign(wallet, { accounts: [{ ...account, address: PublicKey.default.toBase58() }] });
+            change({ accounts: wallet.accounts });
+            return { derivationSeed: new Uint8Array(64) };
+        });
+        await expect(adapter.derivePrivacySeed?.({ protocol: 'tspp-v1' })).rejects.toThrow(WalletAccountError);
+        expect(onError).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps the result if the wallet replaces the account object with the same address', async () => {
+        deriveSeed.mockImplementation(async () => {
+            Object.assign(wallet, { accounts: [{ ...account }] });
+            change({ accounts: wallet.accounts });
+            return { derivationSeed: new Uint8Array(64).fill(7) };
+        });
+        await expect(adapter.derivePrivacySeed?.({ protocol: 'tspp-v1' })).resolves.toEqual({
+            derivationSeed: new Uint8Array(64).fill(7),
+        });
+        expect(onError).not.toHaveBeenCalled();
+    });
+
+    it('accepts a Uint8Array from another realm', async () => {
+        const foreign = runInNewContext('new Uint8Array(64).fill(7)') as Uint8Array;
+        expect(foreign instanceof Uint8Array).toBe(false);
+        deriveSeed.mockResolvedValue({ derivationSeed: foreign });
+        const output = await adapter.derivePrivacySeed?.({ protocol: 'tspp-v1' });
+        expect(output?.derivationSeed).toEqual(new Uint8Array(64).fill(7));
+        expect(output?.derivationSeed instanceof Uint8Array).toBe(true);
+    });
 
     it('discards the result if the wallet disconnects while prompting', async () => {
         deriveSeed.mockImplementation(async () => {
@@ -333,7 +345,10 @@ describe('SolanaWalletAdapterWallet privacy feature', () => {
     });
 
     it('round-trips through StandardWalletAdapter without calling signMessage', async () => {
-        const adapter = new StandardWalletAdapter({ wallet });
+        // The published wallet-adapter-base types predate this workspace's feature types.
+        const adapter = new StandardWalletAdapter({
+            wallet: wallet as unknown as WalletAdapterCompatibleStandardWallet,
+        });
         await adapter.connect();
         await expect(adapter.derivePrivacySeed?.({ protocol: 'tspp-v1' })).resolves.toEqual({
             derivationSeed: new Uint8Array(64).fill(9),
