@@ -1,4 +1,11 @@
-import { type Adapter, isVersionedTransaction, WalletReadyState } from '@solana/wallet-adapter-base';
+import {
+    type Adapter,
+    isVersionedTransaction,
+    WalletAccountError,
+    WalletConfigError,
+    WalletNotConnectedError,
+    WalletReadyState,
+} from '@solana/wallet-adapter-base';
 import { isSolanaChain, type SolanaChain } from '@solana/wallet-standard-chains';
 import {
     SolanaSignAndSendTransaction,
@@ -18,6 +25,8 @@ import {
     type SolanaSignTransactionMethod,
     type SolanaSignTransactionOutput,
     type SolanaTransactionVersion,
+    TSPPDeriveSeed,
+    type TSPPDeriveSeedFeature,
 } from '@solana/wallet-standard-features';
 import { getEndpointForChain } from '@solana/wallet-standard-util';
 import { Connection, Transaction, VersionedTransaction } from '@solana/web3.js';
@@ -58,7 +67,8 @@ export class SolanaWalletAdapterWalletAccount extends ReadonlyWalletAccount {
         const features: (keyof (SolanaSignAndSendTransactionFeature &
             SolanaSignTransactionFeature &
             SolanaSignMessageFeature &
-            SolanaSignInFeature))[] = [SolanaSignAndSendTransaction];
+            SolanaSignInFeature &
+            TSPPDeriveSeedFeature))[] = [SolanaSignAndSendTransaction];
         if ('signTransaction' in adapter) {
             features.push(SolanaSignTransaction);
         }
@@ -67,6 +77,9 @@ export class SolanaWalletAdapterWalletAccount extends ReadonlyWalletAccount {
         }
         if ('signIn' in adapter) {
             features.push(SolanaSignIn);
+        }
+        if ('derivePrivacySeed' in adapter && typeof adapter.derivePrivacySeed === 'function') {
+            features.push(TSPPDeriveSeed);
         }
 
         super({ address, publicKey, chains, features });
@@ -109,7 +122,7 @@ export class SolanaWalletAdapterWallet implements Wallet {
         StandardDisconnectFeature &
         StandardEventsFeature &
         SolanaSignAndSendTransactionFeature &
-        Partial<SolanaSignTransactionFeature & SolanaSignMessageFeature & SolanaSignInFeature> {
+        Partial<SolanaSignTransactionFeature & SolanaSignMessageFeature & SolanaSignInFeature & TSPPDeriveSeedFeature> {
         const features: StandardConnectFeature &
             StandardDisconnectFeature &
             StandardEventsFeature &
@@ -164,7 +177,17 @@ export class SolanaWalletAdapterWallet implements Wallet {
             };
         }
 
-        return { ...features, ...signTransactionFeature, ...signMessageFeature };
+        let deriveSeedFeature: TSPPDeriveSeedFeature | undefined;
+        if ('derivePrivacySeed' in this.#adapter && typeof this.#adapter.derivePrivacySeed === 'function') {
+            deriveSeedFeature = {
+                [TSPPDeriveSeed]: {
+                    version: '1.0.0',
+                    deriveSeed: this.#deriveSeed,
+                },
+            };
+        }
+
+        return { ...features, ...signTransactionFeature, ...signMessageFeature, ...deriveSeedFeature };
     }
 
     get accounts() {
@@ -383,6 +406,16 @@ export class SolanaWalletAdapterWallet implements Wallet {
         }
 
         return outputs;
+    };
+
+    #deriveSeed: TSPPDeriveSeedFeature[typeof TSPPDeriveSeed]['deriveSeed'] = async ({ account, protocol }) => {
+        if (!('derivePrivacySeed' in this.#adapter) || typeof this.#adapter.derivePrivacySeed !== 'function') {
+            throw new WalletConfigError('derivePrivacySeed not implemented by adapter');
+        }
+        if (!this.#account || !this.#adapter.connected) throw new WalletNotConnectedError();
+        if (account !== this.#account) throw new WalletAccountError();
+        if (protocol !== 'tspp-v1') throw new WalletConfigError('Unsupported privacy derivation protocol');
+        return await this.#adapter.derivePrivacySeed({ protocol });
     };
 
     #signIn: SolanaSignInMethod = async (...inputs) => {

@@ -39,7 +39,7 @@
         "@wallet-standard/base": "^1.1.0"
     },
     "devDependencies": {
-        "@solana/wallet-adapter-base": "^0.9.24",
+        "@solana/wallet-adapter-base": "file:../../../../../orca/workspaces/wallet-adapter/flyingfish/packages/core/base",
         "@types/react": "^18.3.19",
         "react": "^18.3.1",
         "shx": "^0.4.0"
