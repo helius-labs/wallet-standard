@@ -47,8 +47,6 @@ import {
 import { arraysEqual } from '@wallet-standard/wallet';
 import bs58 from 'bs58';
 import {
-    assertDecryptRequests,
-    assertDeriveRequests,
     assertShieldedKeysProtocol,
     checkDecryptOutput,
     checkDeriveOutput,
@@ -63,6 +61,8 @@ import {
     type GetShieldedPublicKeysMethod,
     type GetShieldedPublicKeysOutput,
     getShieldedKeysFeature,
+    parseDecryptRequests,
+    parseDeriveRequests,
     WalletShieldedKeysError,
 } from './shieldedKeys.js';
 
@@ -499,42 +499,42 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
 
     decryptShielded: DecryptShieldedMethod | undefined;
     async #decryptShielded(input: DecryptShieldedInput): Promise<DecryptShieldedOutput> {
-        const requests = input?.requests;
         return await this.#callShieldedKeys(
             input,
-            () => assertDecryptRequests(requests),
-            (feature, account, protocol) => feature.decrypt({ account, protocol, requests }),
-            (output) => checkDecryptOutput(requests, output)
+            () => parseDecryptRequests(input?.requests),
+            (feature, account, protocol, requests) => feature.decrypt({ account, protocol, requests }),
+            (output, requests) => checkDecryptOutput(requests, output)
         );
     }
 
     deriveShielded: DeriveShieldedMethod | undefined;
     async #deriveShielded(input: DeriveShieldedInput): Promise<DeriveShieldedOutput> {
-        const requests = input?.requests;
         return await this.#callShieldedKeys(
             input,
-            () => assertDeriveRequests(requests),
-            (feature, account, protocol) => feature.derive({ account, protocol, requests }),
-            (output) => checkDeriveOutput(requests, output)
+            () => parseDeriveRequests(input?.requests),
+            (feature, account, protocol, requests) => feature.derive({ account, protocol, requests }),
+            (output, requests) => checkDeriveOutput(requests, output)
         );
     }
 
-    async #callShieldedKeys<T>(
+    async #callShieldedKeys<P, T>(
         input: { protocol: unknown } | undefined,
-        validateInput: () => void,
+        parseInput: () => P,
         call: (
             feature: TSPPShieldedKeysFeature[typeof TSPPShieldedKeys],
             account: WalletAccount,
-            protocol: 'tspp-v1'
+            protocol: 'tspp-v1',
+            parsed: P
         ) => Promise<unknown>,
-        checkOutput: (output: unknown) => T
+        checkOutput: (output: unknown, parsed: P) => T
     ): Promise<T> {
         try {
             const account = this.#account;
             if (!account) throw new WalletNotConnectedError();
             const protocol = input?.protocol;
             assertShieldedKeysProtocol(protocol);
-            validateInput();
+            // The wallet and the output check use this copy, never the caller's objects.
+            const parsed = parseInput();
 
             const feature = getShieldedKeysFeature(this.#wallet.features);
             if (!feature) throw new WalletConfigError('Wallet does not support tspp:shieldedKeys version 1.0.0');
@@ -544,7 +544,7 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
 
             let output: unknown;
             try {
-                output = await call(feature, account, protocol);
+                output = await call(feature, account, protocol, parsed);
             } catch {
                 throw new WalletShieldedKeysError('Wallet denied or failed the shielded keys request');
             }
@@ -553,7 +553,7 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
             if (this.#account.address !== account.address) {
                 throw new WalletAccountError('Wallet account changed during the shielded keys request');
             }
-            return checkOutput(output);
+            return checkOutput(output, parsed);
         } catch (cause) {
             // Wallet errors can contain private data, so their message and cause are dropped.
             const error =

@@ -72,19 +72,31 @@ export function getShieldedKeysFeature(features: object): TSPPShieldedKeysFeatur
 
 /** Check for a `Uint8Array`, including a `Buffer` or an array from another realm. */
 export function isUint8Array(value: unknown): value is Uint8Array {
-    return Object.prototype.toString.call(value) === '[object Uint8Array]';
+    return ArrayBuffer.isView(value) && Object.prototype.toString.call(value) === '[object Uint8Array]';
 }
 
-function isBytes(value: unknown, length: number): value is Uint8Array {
-    return isUint8Array(value) && value.length === length;
+/**
+ * Copy a byte array into a new `Uint8Array` that the adapter owns, or return
+ * `undefined` if the value is not a `Uint8Array` of the expected length. The copy
+ * cannot change after validation, and `slice()` on a `Buffer` would share memory.
+ */
+function copyBytes(value: unknown, length?: number): Uint8Array | undefined {
+    if (!isUint8Array(value)) return undefined;
+    const copy = new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
+    return length === undefined || copy.length === length ? copy : undefined;
 }
 
-function isTaggedPublicKey(value: unknown): value is Uint8Array {
-    return isBytes(value, TAGGED_X25519_PUBLIC_KEY_LENGTH) && value[0] === X25519_PUBLIC_KEY_TAG;
+function copyTaggedPublicKey(value: unknown): Uint8Array | undefined {
+    const copy = copyBytes(value, TAGGED_X25519_PUBLIC_KEY_LENGTH);
+    return copy && copy[0] === X25519_PUBLIC_KEY_TAG ? copy : undefined;
 }
 
 function isU32(value: unknown): value is number {
     return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= MAX_U32;
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+    return a.length === b.length && a.every((byte, i) => byte === b[i]);
 }
 
 /** Reject a protocol other than `tspp-v1`. */
@@ -92,90 +104,101 @@ export function assertShieldedKeysProtocol(protocol: unknown): asserts protocol 
     if (protocol !== 'tspp-v1') throw new WalletConfigError('Unsupported shielded keys protocol');
 }
 
-/** Reject a malformed decrypt batch before it reaches the wallet. */
-export function assertDecryptRequests(requests: unknown): asserts requests is readonly TSPPDecryptRequest[] {
+/**
+ * Validate a decrypt batch and return a copy built from plain objects and new byte
+ * arrays. Each field is read once, so the wallet receives exactly what was checked.
+ */
+export function parseDecryptRequests(requests: unknown): TSPPDecryptRequest[] {
     if (!Array.isArray(requests)) throw new WalletConfigError('Decrypt requests must be an array');
-    for (const request of requests as unknown[]) {
-        const r = request as Partial<Record<keyof TSPPDecryptRequest, unknown>> | null;
+    return Array.from(requests as unknown[], (request) => {
+        if (!request || typeof request !== 'object') throw new WalletConfigError('Malformed decrypt request');
+        const r = request as Partial<Record<keyof TSPPDecryptRequest, unknown>>;
+        const ciphertext = copyBytes(r.ciphertext);
+        const viewingPublicKey = copyTaggedPublicKey(r.viewingPublicKey);
+        const txViewingPublicKey = copyTaggedPublicKey(r.txViewingPublicKey);
+        const salt = copyBytes(r.salt, SALT_LENGTH);
+        const slotIndex = r.slotIndex;
+        const label = r.label;
         if (
-            !r ||
-            typeof r !== 'object' ||
-            !isUint8Array(r.ciphertext) ||
-            !isTaggedPublicKey(r.viewingPublicKey) ||
-            !isTaggedPublicKey(r.txViewingPublicKey) ||
-            !isBytes(r.salt, SALT_LENGTH) ||
-            !isU32(r.slotIndex) ||
-            (r.label !== 'transfer' && r.label !== 'ringDeposit') ||
-            (r.label === 'ringDeposit' && r.slotIndex !== 0)
+            !ciphertext ||
+            !viewingPublicKey ||
+            !txViewingPublicKey ||
+            !salt ||
+            !isU32(slotIndex) ||
+            (label !== 'transfer' && label !== 'ringDeposit') ||
+            (label === 'ringDeposit' && slotIndex !== 0)
         ) {
             throw new WalletConfigError('Malformed decrypt request');
         }
-    }
+        return { ciphertext, viewingPublicKey, txViewingPublicKey, salt, slotIndex, label };
+    });
 }
 
-/** Reject a malformed derive batch, including build-only kinds, before it reaches the wallet. */
-export function assertDeriveRequests(requests: unknown): asserts requests is readonly TSPPDeriveRequest[] {
+/**
+ * Validate a derive batch, rejecting build-only kinds, and return a copy built from
+ * plain objects and new byte arrays.
+ */
+export function parseDeriveRequests(requests: unknown): TSPPDeriveRequest[] {
     if (!Array.isArray(requests)) throw new WalletConfigError('Derive requests must be an array');
-    for (const request of requests as unknown[]) {
-        const r = request as {
-            kind?: unknown;
-            utxoHash?: unknown;
-            blinding?: unknown;
-            firstNullifier?: unknown;
-        } | null;
-        const valid =
-            !!r &&
-            typeof r === 'object' &&
-            (r.kind === 'nullifier'
-                ? isBytes(r.utxoHash, FIELD_LENGTH) && isBytes(r.blinding, FIELD_LENGTH)
-                : (r.kind === 'mergeOutputKey' || r.kind === 'mergeOutputBlinding') &&
-                  isBytes(r.firstNullifier, FIELD_LENGTH));
-        if (!valid) throw new WalletConfigError('Malformed derive request');
-    }
+    return Array.from(requests as unknown[], (request): TSPPDeriveRequest => {
+        if (!request || typeof request !== 'object') throw new WalletConfigError('Malformed derive request');
+        const r = request as { kind?: unknown; utxoHash?: unknown; blinding?: unknown; firstNullifier?: unknown };
+        const kind = r.kind;
+        if (kind === 'nullifier') {
+            const utxoHash = copyBytes(r.utxoHash, FIELD_LENGTH);
+            const blinding = copyBytes(r.blinding, FIELD_LENGTH);
+            if (utxoHash && blinding) return { kind, utxoHash, blinding };
+        } else if (kind === 'mergeOutputKey' || kind === 'mergeOutputBlinding') {
+            const firstNullifier = copyBytes(r.firstNullifier, FIELD_LENGTH);
+            if (firstNullifier) return { kind, firstNullifier };
+        }
+        throw new WalletConfigError('Malformed derive request');
+    });
 }
 
-/** Validate the wallet's public keys and return copies. */
+/**
+ * Validate the wallet's public keys and return copies. The first viewing key must be
+ * the one in the shielded address, or every decryption under it would yield noise.
+ */
 export function checkPublicKeysOutput(output: unknown): TSPPGetPublicKeysOutput {
     const o = output as Partial<Record<keyof TSPPGetPublicKeysOutput, unknown>> | null;
+    const shieldedAddress = copyBytes(o?.shieldedAddress, SHIELDED_ADDRESS_LENGTH);
     const keys = o?.viewingPublicKeys;
+    const viewingPublicKeys = Array.isArray(keys) ? Array.from(keys as unknown[], copyTaggedPublicKey) : [];
+    const current = viewingPublicKeys[0];
     if (
-        !o ||
-        !isBytes(o.shieldedAddress, SHIELDED_ADDRESS_LENGTH) ||
-        !Array.isArray(keys) ||
-        keys.length === 0 ||
-        !keys.every(isTaggedPublicKey)
+        !shieldedAddress ||
+        !current ||
+        !viewingPublicKeys.every((key): key is Uint8Array => key !== undefined) ||
+        !bytesEqual(current, shieldedAddress.subarray(SHIELDED_ADDRESS_LENGTH - TAGGED_X25519_PUBLIC_KEY_LENGTH))
     ) {
         throw new WalletShieldedKeysError('Wallet returned invalid shielded public keys');
     }
-    return {
-        shieldedAddress: new Uint8Array(o.shieldedAddress),
-        viewingPublicKeys: (keys as Uint8Array[]).map((key) => new Uint8Array(key)),
-    };
+    return { shieldedAddress, viewingPublicKeys };
 }
 
-/** Validate the wallet's plaintexts against the requests and return copies. */
+/** Validate the wallet's plaintexts against the parsed requests and return copies. */
 export function checkDecryptOutput(requests: readonly TSPPDecryptRequest[], output: unknown): TSPPDecryptOutput {
     const plaintexts = (output as Partial<TSPPDecryptOutput> | null)?.plaintexts;
-    if (
-        !Array.isArray(plaintexts) ||
-        plaintexts.length !== requests.length ||
-        !requests.every((request, i) => isBytes(plaintexts[i], request.ciphertext.length))
-    ) {
+    const copies =
+        Array.isArray(plaintexts) && plaintexts.length === requests.length
+            ? requests.map((request, i) => copyBytes((plaintexts as unknown[])[i], request.ciphertext.length))
+            : [];
+    if (copies.length !== requests.length || !copies.every((copy): copy is Uint8Array => copy !== undefined)) {
         throw new WalletShieldedKeysError('Wallet returned invalid plaintexts');
     }
-    // `slice()` on a `Buffer` shares memory, so construct new arrays.
-    return { plaintexts: (plaintexts as Uint8Array[]).map((plaintext) => new Uint8Array(plaintext)) };
+    return { plaintexts: copies };
 }
 
-/** Validate the wallet's derived values against the requests and return copies. */
+/** Validate the wallet's derived values against the parsed requests and return copies. */
 export function checkDeriveOutput(requests: readonly TSPPDeriveRequest[], output: unknown): TSPPDeriveOutput {
     const values = (output as Partial<TSPPDeriveOutput> | null)?.values;
-    if (
-        !Array.isArray(values) ||
-        values.length !== requests.length ||
-        !values.every((value) => isBytes(value, FIELD_LENGTH))
-    ) {
+    const copies =
+        Array.isArray(values) && values.length === requests.length
+            ? Array.from(values as unknown[], (value) => copyBytes(value, FIELD_LENGTH))
+            : [];
+    if (copies.length !== requests.length || !copies.every((copy): copy is Uint8Array => copy !== undefined)) {
         throw new WalletShieldedKeysError('Wallet returned invalid derived values');
     }
-    return { values: (values as Uint8Array[]).map((value) => new Uint8Array(value)) };
+    return { values: copies };
 }

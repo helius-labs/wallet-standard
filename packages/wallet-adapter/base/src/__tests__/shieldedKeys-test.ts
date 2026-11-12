@@ -41,8 +41,14 @@ function taggedKey(fill: number): Uint8Array {
     return key;
 }
 
+function shieldedAddress(viewingPublicKey: Uint8Array): Uint8Array {
+    const address = new Uint8Array(99).fill(1);
+    address.set(viewingPublicKey, 66);
+    return address;
+}
+
 const publicKeys: GetShieldedPublicKeysOutput = {
-    shieldedAddress: new Uint8Array(99).fill(1),
+    shieldedAddress: shieldedAddress(taggedKey(2)),
     viewingPublicKeys: [taggedKey(2), taggedKey(3)],
 };
 
@@ -192,7 +198,9 @@ describe('StandardWalletAdapter shielded keys', () => {
             { ...publicKeys, viewingPublicKeys: [] },
             { ...publicKeys, viewingPublicKeys: [new Uint8Array(33)] },
             { ...publicKeys, viewingPublicKeys: [new Uint8Array(32).fill(4)] },
-            { ...publicKeys, shieldedAddress: Array(99).fill(1) },
+            { ...publicKeys, shieldedAddress: Array.from(publicKeys.shieldedAddress) },
+            { ...publicKeys, viewingPublicKeys: [taggedKey(3), taggedKey(2)] },
+            { ...publicKeys, viewingPublicKeys: [taggedKey(2), new Uint8Array(33)] },
         ])('rejects malformed wallet output (%p)', async (output) => {
             getPublicKeys.mockResolvedValue(output);
             await expect(adapter.getShieldedPublicKeys?.({ protocol })).rejects.toThrow(WalletShieldedKeysError);
@@ -259,6 +267,40 @@ describe('StandardWalletAdapter shielded keys', () => {
                 WalletShieldedKeysError
             );
             expect(onError).toHaveBeenCalledTimes(1);
+        });
+
+        it('passes the wallet a copy of the validated requests, not the caller objects', async () => {
+            const ciphertext = new Uint8Array(13).fill(5);
+            let reads = 0;
+            const request = {
+                ...decryptRequest({ ciphertext }),
+                get slotIndex() {
+                    reads += 1;
+                    return reads === 1 ? 0 : 5;
+                },
+                get label() {
+                    return reads <= 1 ? 'transfer' : 'ringDeposit';
+                },
+            };
+            await adapter.decryptShielded?.({ protocol, requests: [request] as unknown as TSPPDecryptRequest[] });
+            const forwarded = decrypt.mock.calls[0]?.[0]?.requests?.[0];
+            expect(forwarded).not.toBe(request);
+            expect(forwarded.ciphertext).not.toBe(ciphertext);
+            expect(forwarded).toEqual({ ...decryptRequest({ ciphertext }), slotIndex: 0, label: 'transfer' });
+            expect(Object.getOwnPropertyDescriptor(forwarded, 'slotIndex')?.get).toBeUndefined();
+        });
+
+        it.each([
+            ['spoofed toStringTag', { [Symbol.toStringTag]: 'Uint8Array', length: 13 }],
+            ['DataView', new DataView(new ArrayBuffer(13))],
+        ])('rejects a ciphertext that only looks like a Uint8Array (%s)', async (_name, ciphertext) => {
+            await expect(
+                adapter.decryptShielded?.({
+                    protocol,
+                    requests: [decryptRequest({ ciphertext })],
+                })
+            ).rejects.toThrow(WalletConfigError);
+            expectNoWalletCalls();
         });
 
         it('accepts a Uint8Array from another realm', async () => {
