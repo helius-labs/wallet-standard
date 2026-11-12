@@ -27,7 +27,7 @@ const account = null as unknown as WalletAccount;
     {
         ({
             account,
-            message: "",
+            message: '',
             messageVersion: 1,
             requiredSigners: [new Uint8Array()],
         }) satisfies SolanaSignOffchainMessageInputV1;
@@ -48,7 +48,7 @@ const account = null as unknown as WalletAccount;
     {
         ({
             account,
-            message: "",
+            message: '',
             messageVersion: 1,
             requiredSigners: [account.publicKey],
         }) satisfies SolanaSignOffchainMessageInputV1;
