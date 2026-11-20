@@ -16,9 +16,7 @@ export function useStandardWalletAdapters(adapters: Adapter[]): Adapter[] {
             ),
             on('unregister', (...wallets) =>
                 setStandardAdapters((standardAdapters) =>
-                    standardAdapters.filter((standardAdapter) =>
-                        !wallets.includes(standardAdapter.wallet)
-                    )
+                    standardAdapters.filter((standardAdapter) => !wallets.includes(standardAdapter.wallet))
                 )
             ),
         ];

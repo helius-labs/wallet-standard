@@ -30,6 +30,8 @@ import {
     SolanaSignMessage,
     SolanaSignTransaction,
     type SolanaSignTransactionFeature,
+    TSPPShieldedKeys,
+    type TSPPShieldedKeysFeature,
 } from '@solana/wallet-standard-features';
 import { getChainForEndpoint, getCommitment } from '@solana/wallet-standard-util';
 import type { Connection, TransactionSignature } from '@solana/web3.js';
@@ -44,6 +46,25 @@ import {
 } from '@wallet-standard/features';
 import { arraysEqual } from '@wallet-standard/wallet';
 import bs58 from 'bs58';
+import {
+    assertShieldedKeysProtocol,
+    checkDecryptOutput,
+    checkDeriveOutput,
+    checkPublicKeysOutput,
+    type DecryptShieldedInput,
+    type DecryptShieldedMethod,
+    type DecryptShieldedOutput,
+    type DeriveShieldedInput,
+    type DeriveShieldedMethod,
+    type DeriveShieldedOutput,
+    type GetShieldedPublicKeysInput,
+    type GetShieldedPublicKeysMethod,
+    type GetShieldedPublicKeysOutput,
+    getShieldedKeysFeature,
+    parseDecryptRequests,
+    parseDeriveRequests,
+    WalletShieldedKeysError,
+} from './shieldedKeys.js';
 
 /** TODO: docs */
 export interface StandardWalletAdapterConfig {
@@ -219,6 +240,16 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
             this.signMessage = this.#signMessage;
         } else {
             delete this.signMessage;
+        }
+
+        if (getShieldedKeysFeature(this.#wallet.features) && this.#account?.features.includes(TSPPShieldedKeys)) {
+            this.getShieldedPublicKeys = this.#getShieldedPublicKeys;
+            this.decryptShielded = this.#decryptShielded;
+            this.deriveShielded = this.#deriveShielded;
+        } else {
+            delete this.getShieldedPublicKeys;
+            delete this.decryptShielded;
+            delete this.deriveShielded;
         }
 
         if (SolanaSignIn in this.#wallet.features) {
@@ -451,6 +482,82 @@ export class StandardWalletAdapter extends BaseWalletAdapter implements Standard
                 throw new WalletSignMessageError(error?.message, error);
             }
         } catch (error: any) {
+            this.emit('error', error);
+            throw error;
+        }
+    }
+
+    getShieldedPublicKeys: GetShieldedPublicKeysMethod | undefined;
+    async #getShieldedPublicKeys(input: GetShieldedPublicKeysInput): Promise<GetShieldedPublicKeysOutput> {
+        return await this.#callShieldedKeys(
+            input,
+            () => undefined,
+            (feature, account, protocol) => feature.getPublicKeys({ account, protocol }),
+            checkPublicKeysOutput
+        );
+    }
+
+    decryptShielded: DecryptShieldedMethod | undefined;
+    async #decryptShielded(input: DecryptShieldedInput): Promise<DecryptShieldedOutput> {
+        return await this.#callShieldedKeys(
+            input,
+            () => parseDecryptRequests(input?.requests),
+            (feature, account, protocol, requests) => feature.decrypt({ account, protocol, requests }),
+            (output, requests) => checkDecryptOutput(requests, output)
+        );
+    }
+
+    deriveShielded: DeriveShieldedMethod | undefined;
+    async #deriveShielded(input: DeriveShieldedInput): Promise<DeriveShieldedOutput> {
+        return await this.#callShieldedKeys(
+            input,
+            () => parseDeriveRequests(input?.requests),
+            (feature, account, protocol, requests) => feature.derive({ account, protocol, requests }),
+            (output, requests) => checkDeriveOutput(requests, output)
+        );
+    }
+
+    async #callShieldedKeys<P, T>(
+        input: { protocol: unknown } | undefined,
+        parseInput: () => P,
+        call: (
+            feature: TSPPShieldedKeysFeature[typeof TSPPShieldedKeys],
+            account: WalletAccount,
+            protocol: 'tspp-v1',
+            parsed: P
+        ) => Promise<unknown>,
+        checkOutput: (output: unknown, parsed: P) => T
+    ): Promise<T> {
+        try {
+            const account = this.#account;
+            if (!account) throw new WalletNotConnectedError();
+            const protocol = input?.protocol;
+            assertShieldedKeysProtocol(protocol);
+            // The wallet and the output check use this copy, never the caller's objects.
+            const parsed = parseInput();
+
+            const feature = getShieldedKeysFeature(this.#wallet.features);
+            if (!feature) throw new WalletConfigError('Wallet does not support tspp:shieldedKeys version 1.0.0');
+            if (!account.features.includes(TSPPShieldedKeys)) {
+                throw new WalletAccountError('Account does not support shielded keys');
+            }
+
+            let output: unknown;
+            try {
+                output = await call(feature, account, protocol, parsed);
+            } catch {
+                throw new WalletShieldedKeysError('Wallet denied or failed the shielded keys request');
+            }
+            if (!this.#account) throw new WalletNotConnectedError();
+            // Wallets may replace account objects on any change, so compare addresses.
+            if (this.#account.address !== account.address) {
+                throw new WalletAccountError('Wallet account changed during the shielded keys request');
+            }
+            return checkOutput(output, parsed);
+        } catch (cause) {
+            // Wallet errors can contain private data, so their message and cause are dropped.
+            const error =
+                cause instanceof WalletError ? cause : new WalletShieldedKeysError('Shielded keys request failed');
             this.emit('error', error);
             throw error;
         }

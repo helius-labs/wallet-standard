@@ -1,4 +1,11 @@
-import { type Adapter, isVersionedTransaction, WalletReadyState } from '@solana/wallet-adapter-base';
+import {
+    type Adapter,
+    isVersionedTransaction,
+    WalletAccountError,
+    WalletConfigError,
+    WalletNotConnectedError,
+    WalletReadyState,
+} from '@solana/wallet-adapter-base';
 import { isSolanaChain, type SolanaChain } from '@solana/wallet-standard-chains';
 import {
     SolanaSignAndSendTransaction,
@@ -18,11 +25,16 @@ import {
     type SolanaSignTransactionMethod,
     type SolanaSignTransactionOutput,
     type SolanaTransactionVersion,
+    type TSPPDecryptMethod,
+    type TSPPDeriveMethod,
+    type TSPPGetPublicKeysMethod,
+    TSPPShieldedKeys,
+    type TSPPShieldedKeysFeature,
 } from '@solana/wallet-standard-features';
 import { getEndpointForChain } from '@solana/wallet-standard-util';
 import { Connection, Transaction, VersionedTransaction } from '@solana/web3.js';
 import { getWallets } from '@wallet-standard/app';
-import type { Wallet, WalletIcon } from '@wallet-standard/base';
+import type { Wallet, WalletAccount, WalletIcon } from '@wallet-standard/base';
 import {
     StandardConnect,
     type StandardConnectFeature,
@@ -38,6 +50,37 @@ import {
 } from '@wallet-standard/features';
 import { arraysEqual, bytesEqual, ReadonlyWalletAccount } from '@wallet-standard/wallet';
 import bs58 from 'bs58';
+import {
+    assertShieldedKeysProtocol,
+    type DecryptShieldedMethod,
+    type DeriveShieldedMethod,
+    type GetShieldedPublicKeysMethod,
+} from './shieldedKeys.js';
+
+interface ShieldedKeysMethods {
+    getShieldedPublicKeys: GetShieldedPublicKeysMethod;
+    decryptShielded: DecryptShieldedMethod;
+    deriveShielded: DeriveShieldedMethod;
+}
+
+/** Return the adapter's shielded keys methods, bound to the adapter, if it has all of them. */
+function getShieldedKeysMethods(adapter: Adapter): ShieldedKeysMethods | undefined {
+    const { getShieldedPublicKeys, decryptShielded, deriveShielded } = adapter as Partial<
+        Record<keyof ShieldedKeysMethods, unknown>
+    >;
+    if (
+        typeof getShieldedPublicKeys !== 'function' ||
+        typeof decryptShielded !== 'function' ||
+        typeof deriveShielded !== 'function'
+    ) {
+        return undefined;
+    }
+    return {
+        getShieldedPublicKeys: getShieldedPublicKeys.bind(adapter) as GetShieldedPublicKeysMethod,
+        decryptShielded: decryptShielded.bind(adapter) as DecryptShieldedMethod,
+        deriveShielded: deriveShielded.bind(adapter) as DeriveShieldedMethod,
+    };
+}
 
 /** TODO: docs */
 export class SolanaWalletAdapterWalletAccount extends ReadonlyWalletAccount {
@@ -58,7 +101,8 @@ export class SolanaWalletAdapterWalletAccount extends ReadonlyWalletAccount {
         const features: (keyof (SolanaSignAndSendTransactionFeature &
             SolanaSignTransactionFeature &
             SolanaSignMessageFeature &
-            SolanaSignInFeature))[] = [SolanaSignAndSendTransaction];
+            SolanaSignInFeature &
+            TSPPShieldedKeysFeature))[] = [SolanaSignAndSendTransaction];
         if ('signTransaction' in adapter) {
             features.push(SolanaSignTransaction);
         }
@@ -67,6 +111,9 @@ export class SolanaWalletAdapterWalletAccount extends ReadonlyWalletAccount {
         }
         if ('signIn' in adapter) {
             features.push(SolanaSignIn);
+        }
+        if (getShieldedKeysMethods(adapter)) {
+            features.push(TSPPShieldedKeys);
         }
 
         super({ address, publicKey, chains, features });
@@ -109,7 +156,9 @@ export class SolanaWalletAdapterWallet implements Wallet {
         StandardDisconnectFeature &
         StandardEventsFeature &
         SolanaSignAndSendTransactionFeature &
-        Partial<SolanaSignTransactionFeature & SolanaSignMessageFeature & SolanaSignInFeature> {
+        Partial<
+            SolanaSignTransactionFeature & SolanaSignMessageFeature & SolanaSignInFeature & TSPPShieldedKeysFeature
+        > {
         const features: StandardConnectFeature &
             StandardDisconnectFeature &
             StandardEventsFeature &
@@ -164,7 +213,19 @@ export class SolanaWalletAdapterWallet implements Wallet {
             };
         }
 
-        return { ...features, ...signTransactionFeature, ...signMessageFeature };
+        let shieldedKeysFeature: TSPPShieldedKeysFeature | undefined;
+        if (getShieldedKeysMethods(this.#adapter)) {
+            shieldedKeysFeature = {
+                [TSPPShieldedKeys]: {
+                    version: '1.0.0',
+                    getPublicKeys: this.#getPublicKeys,
+                    decrypt: this.#decrypt,
+                    derive: this.#derive,
+                },
+            };
+        }
+
+        return { ...features, ...signTransactionFeature, ...signMessageFeature, ...shieldedKeysFeature };
     }
 
     get accounts() {
@@ -383,6 +444,27 @@ export class SolanaWalletAdapterWallet implements Wallet {
         }
 
         return outputs;
+    };
+
+    #shieldedKeysMethods(account: WalletAccount, protocol: unknown): ShieldedKeysMethods {
+        const methods = getShieldedKeysMethods(this.#adapter);
+        if (!methods) throw new WalletConfigError('shielded keys not implemented by adapter');
+        if (!this.#account || !this.#adapter.connected) throw new WalletNotConnectedError();
+        if (account !== this.#account) throw new WalletAccountError();
+        assertShieldedKeysProtocol(protocol);
+        return methods;
+    }
+
+    #getPublicKeys: TSPPGetPublicKeysMethod = async ({ account, protocol }) => {
+        return await this.#shieldedKeysMethods(account, protocol).getShieldedPublicKeys({ protocol });
+    };
+
+    #decrypt: TSPPDecryptMethod = async ({ account, protocol, requests }) => {
+        return await this.#shieldedKeysMethods(account, protocol).decryptShielded({ protocol, requests });
+    };
+
+    #derive: TSPPDeriveMethod = async ({ account, protocol, requests }) => {
+        return await this.#shieldedKeysMethods(account, protocol).deriveShielded({ protocol, requests });
     };
 
     #signIn: SolanaSignInMethod = async (...inputs) => {
